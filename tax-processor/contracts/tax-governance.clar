@@ -1,4 +1,4 @@
-;; Automated Tax Calculator Contract
+;; Enhanced Automated Tax Calculator Contract
 ;; Handles complex tax calculations, multiple currencies, deductions, and detailed reporting
 
 ;; Error codes
@@ -11,6 +11,7 @@
 (define-constant ERR-INVALID-DEDUCTION (err u106))
 (define-constant ERR-REFUND-NOT-ALLOWED (err u107))
 (define-constant ERR-INVALID-PERIOD (err u108))
+(define-constant ERR-TRANSFER-FAILED (err u109))
 
 ;; Data variables
 (define-data-var administrator principal tx-sender)
@@ -71,6 +72,10 @@
 )
 
 ;; Read-only functions for enhanced reporting
+(define-read-only (get-taxpayer-profile (taxpayer principal))
+    (map-get? taxpayer-profiles taxpayer)
+)
+
 (define-read-only (get-tax-bracket-info (income-category (string-ascii 24)))
     (map-get? income-tax-brackets { income-category: income-category })
 )
@@ -98,7 +103,7 @@
         bracket-data
         (let ((total-tax-due u0))
             (ok (fold calculate-bracket-tax-amount 
-                (get tax-brackets (unwrap! bracket-data ERR-TAX-RATE-NOT-FOUND))
+                (get tax-brackets bracket-data)
                 { remaining-income: income-amount, accumulated-tax: u0 })))
         ERR-TAX-RATE-NOT-FOUND
     )
@@ -121,7 +126,24 @@
     )
 )
 
-;; Public functions
+;; Define helper function to update deduction approval
+(define-private (update-deduction-approval 
+    (index uint) 
+    (current-index uint) 
+    (deduction { deduction-code: (string-ascii 10), deduction-amount: uint, deduction-approved: bool })
+    (target-index uint))
+    (if (is-eq current-index target-index)
+        ;; If this is the target index, return updated deduction with approved status
+        {
+            deduction-code: (get deduction-code deduction),
+            deduction-amount: (get deduction-amount deduction),
+            deduction-approved: true
+        }
+        ;; Otherwise return the original deduction unchanged
+        deduction)
+)
+
+;; Enhanced public functions
 (define-public (update-exchange-rate (currency-code (string-ascii 10)) (new-rate uint))
     (begin
         (asserts! (is-eq tx-sender (var-get administrator)) ERR-NOT-AUTHORIZED)
@@ -152,46 +174,73 @@
 (define-public (submit-deduction-request (deduction-code (string-ascii 10)) (deduction-amount uint))
     (let (
         (deduction-details (unwrap! (get-deduction-info deduction-code) ERR-INVALID-DEDUCTION))
-        (taxpayer-profile (unwrap! (get-taxpayer-profile tx-sender) ERR-TAX-RATE-NOT-FOUND))
+        (taxpayer-profile (default-to 
+            {
+                cumulative-tax-paid: u0,
+                cumulative-tax-refunded: u0,
+                most-recent-payment: u0,
+                taxpayer-category: "",
+                claimed-deductions: (list ),
+                transaction-history: (list )
+            }
+            (get-taxpayer-profile tx-sender)))
     )
         (begin
             (asserts! (<= deduction-amount (get maximum-deduction-amount deduction-details)) ERR-INVALID-AMOUNT)
             (ok (map-set taxpayer-profiles
                 tx-sender
-                (merge taxpayer-profile {
-                    claimed-deductions: (unwrap-panic (as-max-len?
+                {
+                    cumulative-tax-paid: (get cumulative-tax-paid taxpayer-profile),
+                    cumulative-tax-refunded: (get cumulative-tax-refunded taxpayer-profile),
+                    most-recent-payment: (get most-recent-payment taxpayer-profile),
+                    taxpayer-category: (get taxpayer-category taxpayer-profile),
+                    claimed-deductions: (unwrap-panic (as-max-len? 
                         (append (get claimed-deductions taxpayer-profile)
-                            { deduction-code: deduction-code,
-                              deduction-amount: deduction-amount,
-                              deduction-approved: (not (get approval-required deduction-details)) })
-                        u20))
-                })
+                            {
+                                deduction-code: deduction-code,
+                                deduction-amount: deduction-amount,
+                                deduction-approved: (not (get approval-required deduction-details))
+                            })
+                        u20)),
+                    transaction-history: (get transaction-history taxpayer-profile)
+                }
             ))
         )
     )
 )
 
+;; Modified approve-deduction-request function
 (define-public (approve-deduction-request (taxpayer principal) (deduction-index uint))
-    (begin
-        (asserts! (is-eq tx-sender (var-get administrator)) ERR-NOT-AUTHORIZED)
-        (match (get-taxpayer-profile taxpayer)
-            taxpayer-profile 
+    (let (
+        (taxpayer-profile (unwrap! (get-taxpayer-profile taxpayer) ERR-TAX-RATE-NOT-FOUND))
+        (current-deductions (get claimed-deductions taxpayer-profile))
+    )
+        (begin
+            (asserts! (is-eq tx-sender (var-get administrator)) ERR-NOT-AUTHORIZED)
+            (asserts! (< deduction-index (len current-deductions)) ERR-INVALID-DEDUCTION)
+            
             (ok (map-set taxpayer-profiles
                 taxpayer
-                (merge taxpayer-profile {
-                    claimed-deductions: (replace-at? 
-                        (get claimed-deductions taxpayer-profile)
-                        deduction-index
-                        (merge (unwrap-panic (element-at? (get claimed-deductions taxpayer-profile) deduction-index))
-                            { deduction-approved: true })
-                    )
-                })
+                {
+                    cumulative-tax-paid: (get cumulative-tax-paid taxpayer-profile),
+                    cumulative-tax-refunded: (get cumulative-tax-refunded taxpayer-profile),
+                    most-recent-payment: (get most-recent-payment taxpayer-profile),
+                    taxpayer-category: (get taxpayer-category taxpayer-profile),
+                    claimed-deductions: (unwrap-panic (as-max-len? 
+                        (map update-deduction-approval 
+                            (list deduction-index)
+                            (list u0)
+                            current-deductions
+                            (list deduction-index))
+                        u20)),
+                    transaction-history: (get transaction-history taxpayer-profile)
+                }
             ))
-            ERR-TAX-RATE-NOT-FOUND
         )
     )
 )
 
+;; Modified issue-tax-refund function to use native STX transfer
 (define-public (issue-tax-refund (taxpayer principal) (refund-amount uint) (refund-currency (string-ascii 10)))
     (let (
         (taxpayer-profile (unwrap! (get-taxpayer-profile taxpayer) ERR-TAX-RATE-NOT-FOUND))
@@ -200,24 +249,31 @@
         (begin
             (asserts! (is-eq tx-sender (var-get administrator)) ERR-NOT-AUTHORIZED)
             (asserts! (<= converted-refund-amount (get cumulative-tax-paid taxpayer-profile)) ERR-REFUND-NOT-ALLOWED)
-            (asserts! (is-eq (contract-call? .stx-token transfer converted-refund-amount (var-get administrator) taxpayer) (ok true)) ERR-INSUFFICIENT-BALANCE)
+            ;; Use stx-transfer instead of contract-call
+            (try! (stx-transfer? converted-refund-amount (var-get administrator) taxpayer))
             (ok (map-set taxpayer-profiles
                 taxpayer
-                (merge taxpayer-profile {
+                {
+                    cumulative-tax-paid: (get cumulative-tax-paid taxpayer-profile),
                     cumulative-tax-refunded: (+ (get cumulative-tax-refunded taxpayer-profile) converted-refund-amount),
+                    most-recent-payment: (get most-recent-payment taxpayer-profile),
+                    taxpayer-category: (get taxpayer-category taxpayer-profile),
+                    claimed-deductions: (get claimed-deductions taxpayer-profile),
                     transaction-history: (unwrap-panic (as-max-len?
                         (append (get transaction-history taxpayer-profile)
-                            { transaction-amount: (- u0 converted-refund-amount),
-                              transaction-timestamp: block-height,
-                              transaction-currency: refund-currency })
+                            { 
+                                transaction-amount: (- u0 converted-refund-amount),
+                                transaction-timestamp: block-height,
+                                transaction-currency: refund-currency 
+                            })
                         u50))
-                })
+                }
             ))
         )
     )
 )
 
-;; Reporting functions
+;; Enhanced reporting functions
 (define-read-only (generate-annual-tax-report (taxpayer principal) (tax-year uint))
     (let (
         (taxpayer-profile (unwrap! (get-taxpayer-profile taxpayer) ERR-TAX-RATE-NOT-FOUND))
@@ -250,37 +306,4 @@
     (if (get deduction-approved deduction)
         (+ running-total (get deduction-amount deduction))
         running-total)
-)
-
-;; Helper merge function for record updates
-(define-private (merge (record-a {
-        cumulative-tax-paid: uint,
-        cumulative-tax-refunded: uint,
-        most-recent-payment: uint,
-        taxpayer-category: (string-ascii 24),
-        claimed-deductions: (list 20 {
-            deduction-code: (string-ascii 10),
-            deduction-amount: uint,
-            deduction-approved: bool
-        }),
-        transaction-history: (list 50 {
-            transaction-amount: uint,
-            transaction-timestamp: uint,
-            transaction-currency: (string-ascii 10)
-        })
-    }) (record-b {
-        claimed-deductions: (list 20 {
-            deduction-code: (string-ascii 10),
-            deduction-amount: uint,
-            deduction-approved: bool
-        })
-    }))
-    {
-        cumulative-tax-paid: (get cumulative-tax-paid record-a),
-        cumulative-tax-refunded: (get cumulative-tax-refunded record-a),
-        most-recent-payment: (get most-recent-payment record-a),
-        taxpayer-category: (get taxpayer-category record-a),
-        claimed-deductions: (get claimed-deductions record-b),
-        transaction-history: (get transaction-history record-a)
-    }
 )
